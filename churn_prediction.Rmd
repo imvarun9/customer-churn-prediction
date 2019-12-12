@@ -1,0 +1,834 @@
+---
+title: "Customer Churn Prediction"
+output:
+  html_notebook: 
+    code_folding: hide
+    fig_height: 10
+    fig_width: 10
+    number_section: yes
+    theme: default
+    toc: yes
+    toc_collapsed: yes
+    toc_depth: 4
+    toc_float: yes
+---
+
+```{r global_options}
+knitr::opts_chunk$set(fig.width = 10, fig.height = 10, fig.path = 'Figs/', warning = FALSE, message = FALSE)
+```
+
+# Introduction
+**Customer churn occurs when customers or subscribers stop doing business** with a company or service. This is also called customer attrition or customer defection. Many service providers such as telephone companies, internet or insurance firms, banks often use customer churn analysis as one of the key business metrics because the cost of retaining an existing customer is far less than acquiring new ones. 
+
+## About the data
+
+1. The target variable is called *Churn* - it represents customers who left within the last month.
+2. Demographic information of customers is captured in *gender*, *age*, *partners* and *dependents* variables.
+3. Customer account information is present in *contract*, *payment method*, *Monthly charges*, *total charges* and *tenure*.
+4. Services opted by customers are in *Phone service*, *Multiple lines*, *Online backup*, *Tech support*, *Streaming Movies/TV*.
+
+
+# Objective 
+
+This the demonstration in R to analyze all relevant customer data and compare various machine learning models including deep neural networks to predict customer churn.  
+
+# Load libraries and functions
+
+Load packages like *tidyverse*, *purrr*, *gridExtra*, *caret* and functions.
+```{r load_libraries_functions, message=FALSE, warning=FALSE}
+library("readr")
+library("dplyr")
+library("tidyr")
+library("purrr")
+library("corrplot")
+library("stringr")
+library("ROCR")
+library("ggplot2")
+library("gridExtra")
+library("caret")
+library("kableExtra")
+library("keras")
+library("doParallel")
+
+
+# This function calculates the confusion matrix
+cm <- function(model, data, target){
+confusionMatrix(predict(model, newdata = data), target, mode = "prec_recall")
+}
+
+# This function identifies and plots the best probability cutoff values by maximizing tpr and fpr values from the ROC plot 
+roc_cutoff <- function(model, data, target) {
+# Check for the stack models  
+if(str_detect(deparse(substitute(model)),'stack')) {
+pred <- predict(model, data, type = "prob") %>% data.frame(No = ., Yes = 1 -.)
+pred <- pred[,1]
+}
+else{
+pred <- predict(model, data, type = 'prob')[,2]
+}
+# ROCR considers the later level to be the positive class. 
+pred <- prediction(pred, target, label.ordering = c("No","Yes"))
+eval <- performance(pred, "tpr","fpr")
+# Calculate AUC value
+pref_auc <- performance(pred, "auc")
+auc <- pref_auc@y.values[[1]]
+
+plot(eval)
+
+# maximize the TPR and FPR
+max <- which.max(slot(eval,"y.values")[[1]] +  1 - slot(eval,"x.values")[[1]])
+# get the best cutoff value
+cutoff <- slot(eval, "alpha.values")[[1]][max]
+tpr <- slot(eval, "y.values")[[1]][max]
+fpr <- slot(eval, "x.values")[[1]][max]
+abline(h = tpr, v = fpr, lty = 2, col = "blue") # best cutoff
+text(0.7,0.2, paste0("At best cutoff = ", round(cutoff,2)), col = "blue")
+# Default cutoff
+default <- last(which(slot(eval, "alpha.values")[[1]] >= 0.5))
+defaulty <- slot(eval,"y.values")[[1]][default]
+defaultx <- slot(eval,"x.values")[[1]][default]
+abline(h = defaulty, v = defaultx, col = "red", lty = 2) # Default cutoff
+text(0.7,0.3, paste0("At default cutoff = ", 0.50), col = "red")
+text(0.7, 0.4, paste0("AUC = ", round(auc,2)))
+return(cutoff)
+}
+
+# Find the missing values in the columns of the dataframe
+missing_values <- function(df){
+  
+missing <- df %>% gather(key = "key", value = "value") %>% mutate(is.missing = is.na(value)) %>% 
+  group_by(key) %>% mutate(total = n()) %>% 
+  group_by(key, total, is.missing) %>%
+    summarise(num.missing = n()) %>% 
+    mutate(perc.missing = num.missing/total * 100) %>% ungroup()
+  
+  return(missing)
+}
+
+# Plot add on services
+plot_addon_services <- function(df,group_var){
+  # Filter customers who have internet at home
+  withInternet <- df %>% filter(InternetService %ni% c("No"))
+  # Group by Churn and add on service var and calculate the Percentage of customers
+  withInternet %>% group_by(Churn, !! sym(group_var)) %>% tally(name = "count") %>% 
+    mutate(Percent = count /nrow(withInternet)) %>%
+    mutate(Percent = round(Percent,2)) %>%
+    # Plot the percentage and Churn behaviour of each group
+    ggplot(aes(x = !! sym(group_var), y = Percent, fill = Churn)) + geom_bar(stat = "identity") + 
+    geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + 
+    theme_minimal() + scale_fill_brewer(palette="Dark2") + 
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+}
+
+'%ni%' <- Negate('%in%')
+```
+
+# Data preprocessing and cleaning
+
+The data was downloaded from [Kaggle](https://www.kaggle.com/blastchar/telco-customer-churn). The data contains **7043 rows** and **21 columns** (variables) including the binary target variable called *Churn*. 
+
+```{r read_print, message=FALSE, warning=FALSE}
+
+churn <- read_csv("C:\\Users\\khannva1\\Documents\\DS-Projects\\telco-customer-churn\\WA_Fn-UseC_-Telco-Customer-Churn.csv")
+print(churn)
+```
+
+1. Replace *"No internet service"* to *"No"*.
+2. Remove *"(automatic)"* from PaymentMethod column.
+3. Recode *SeniorCitizen* column to factor. Make "1" = "Yes" and "0" = "No"
+4. Recode *tenure* column to categorical column.
+5. Remove customerID column from the dataset.
+6. Convert *character* columns to *factor* columns.
+
+```{r preprocess, message=FALSE, warning=FALSE}
+# Map "No internet service to No"
+
+recode <- c("OnlineSecurity", "OnlineBackup", "DeviceProtection", "TechSupport", "StreamingTV", "StreamingMovies", "MultipleLines")
+
+churn <- as.data.frame(churn)
+
+for (col in recode) {
+  churn[,col] <- as.character(churn[,col])
+  temp <- if_else(churn[,col] %in% c("No internet service","No phone service"), "No",churn[,col])
+churn[,col] <- as.factor(temp)
+}
+
+# Remove (automatic) from PaymentMethod
+churn$PaymentMethod <- str_remove(churn$PaymentMethod, "\\(automatic\\)") %>% str_trim(., side = "right") %>% as.factor()
+
+# Does not make sense to have senior citizen as numbers. 
+churn$SeniorCitizen <- as.factor(recode(churn$SeniorCitizen, "1" = "Yes", "0" = "No"))
+
+# Make tenure as categorical variable for easier ploting 
+churn <- churn %>% mutate(tenure_group = case_when(tenure <= 12 ~ "0-12M",
+                                           tenure >12 & tenure <=24 ~ "12-24M",
+                                           tenure > 24 & tenure <= 48 ~ "24-48M",
+                                           tenure > 48 & tenure <= 60 ~ "48-60M",
+                                           tenure >60 ~ ">60M"
+                ))
+churn$tenure_group <- as.factor(churn$tenure_group)
+
+# Remove columns not needed
+
+churn <- churn %>% select(-one_of(c("customerID")))
+
+# Turn character columns to factor
+recode <- churn %>% select_if(is.character) %>% colnames()
+
+for(col in recode){
+  churn[,col] <-  as.factor(churn[,col])
+
+}
+
+## Look at the unique values after cleaning 
+
+churn[-1] %>% select_if(is.factor) %>% map(function(x) unique(x))
+```
+
+
+## Missing values
+
+```{r missing_values, warning=FALSE}
+missing <- missing_values(churn)
+
+p1 <- ggplot(missing) + geom_bar(aes( x= reorder(key, desc(perc.missing)), y = perc.missing, fill = is.missing), stat = 'identity', alpha = 0.8) + scale_fill_manual(name = "", values = c('steelblue','tomato3'), label = c("Present", "Missing")) + coord_flip() + labs(title = "Percentage of missing values",x = '',y = '% missing')
+
+# Plot missing values
+p1
+
+# remove rows with missing values
+churn <- na.omit(churn)
+```
+
+# Exploratory data analysis
+
+```{r eda}
+print("Percentage of customers churn")
+prop.table(table(churn$Churn))
+```
+
+From the table above we notice that 73.4% of the customers did not churn. This can serve as our baseline model *i.e.* if we predict every customer to not churn we will be right on average 73.4% of the time. Let us explore the data further. 
+
+## Correlation plot between numeric variables
+
+```{r plots}
+# Correlation matrix of numeric variables
+cor_matrix<- churn %>% select_if(is.numeric) %>% cor()
+
+corrplot(cor_matrix,method = "number", type = "upper")
+```
+
+## Plots of categorical variables
+
+```{r relation_plot1, fig.height=11, fig.width=13}
+
+p1 <- churn %>% group_by(gender, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = gender, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p2 <- churn %>% group_by(SeniorCitizen, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = SeniorCitizen, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.0, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p3 <- churn %>% group_by(Partner, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = Partner, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p4 <- churn %>% group_by(Dependents, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = Dependents, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p5 <- churn %>% group_by(PhoneService, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = PhoneService, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.0, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p6 <- churn %>% group_by(MultipleLines, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = MultipleLines, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p7 <- churn %>% group_by(InternetService, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = InternetService, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p8 <- churn %>% group_by(OnlineSecurity, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = OnlineSecurity, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+grid.arrange(p1, p2, p3, p4, p5, p6, p7, p8, ncol=4)
+```
+
+1. **Does gender makes a difference?** It does not seem to play any significant role in predicting customer churn.
+
+2. **How does Senior Citizen behave?** Almost 50% of the total Senior citizen's population churn. A company could come up with offers specifically catering for senior citizen demands.
+
+3. **Does having a partner makes a difference?** It seems like a customer without a partner is more likely to churn than customers with the partner.
+
+4. **Effect of dependents?** Customers with dependents are more likely to stay than without. However, customers with dependents are only 30% of the total customer population.
+
+5. **Phone service** Customers without phone service are less likely to churn however, they form only 9% of the total customers.
+
+6. **Multiple lines** I don't know what multiple lines mean. However, it seems that customers with multiple lines are more likely to churn. 
+
+7. **Customers with Internet services** It is very interesting to see that customers with Fiber optic internet service at home are highly prone to churning. 
+
+8. **Customers with Online security** Customers with online security are more likely to stay.
+
+```{r relation_plot2, fig.height=11, fig.width=13}
+p1 <- churn %>% group_by(OnlineBackup, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = OnlineBackup, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+
+p2 <- churn %>% group_by(DeviceProtection, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = DeviceProtection, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p3 <- churn %>% group_by(TechSupport, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = TechSupport, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p4 <- churn %>% group_by(StreamingTV, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = StreamingTV, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p5 <- churn %>% group_by(StreamingMovies, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = StreamingMovies, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p6 <- churn %>% group_by(Contract, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = Contract, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+p7 <- churn %>% group_by(PaperlessBilling, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = PaperlessBilling, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+p8 <- churn %>% group_by(PaymentMethod, Churn) %>% summarise(Percent = round(n()/nrow(.),2)) %>% ggplot(aes(x = PaymentMethod, y = Percent, fill = Churn)) + geom_bar(stat = "identity") + geom_text(aes(label = Percent * 100), vjust = 1.5, hjust = 0.5,color = "white", size = 5.0) + theme_minimal() + scale_fill_brewer(palette="Dark2") + scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+grid.arrange(p1, p2, p3, p4, p5, p6, p7, p8, ncol=4)
+
+```
+
+What is the effect of internet addons on customer churning? Let us explore.
+
+1. **Online backup and Device Protection service:** Customers with online backup and device protection services are less likely to churn. They like these add ons. 
+
+2. **Technical support** Customers who opt for technical support are less likely to churn. Although fewer customers opt for technical support service however if they do they seem to stay the company.
+
+3. **Does Streaming services help retain customers?** I would thik that those customers who opt for streaming services are more likely to stay interestingly, it is the opposite they are more prone to churning.
+
+4. **What about Contract period?** Very interesting pattern. If the company can engage customers in 1 year or more contract customers are almost certain to stay.
+
+5. **Paperless billing**. It is interesting to see that customers who opt for paperless billing service are more likely to churn. It may be because people tend to forget paying bills and if the bill is hiding somewhere in their email or SMS it becomes even more difficult to remember and pay on time, therefore, most likely they miss the due date and end up paying extra which makes them unhappy with the company and they churn.
+
+6. **Payment method** Very interesting pattern. Of all the customers paying bills through electronic check almost half of the customers churn. It may be due to the bad experience like bouncing of checks or some error on the company's part in processing check payments. 
+
+
+## Some other interesting plots
+
+Let us take a **deeper look** at the popularity of add on services such as *Tech Support*, *Streaming Movies*, *Online backup*, etc. for the **customers who have the internet at home**. For this, we will filter out customers with the internet at home.
+```{r addon_plots, fig.height=11, fig.width=13}
+# Create an adds on vector
+adds_on <- names(churn)[7:14]
+
+addson_plots <- map(adds_on, plot_addon_services, df = churn)
+
+p1 <- addson_plots[[1]] + ggtitle("Popularity of add on services")
+p2 <- addson_plots[[2]]
+p3 <- addson_plots[[3]]
+p4 <- addson_plots[[4]]
+p5 <- addson_plots[[5]]
+p6 <- addson_plots[[6]]
+p7 <- addson_plots[[7]]
+p8 <- addson_plots[[8]]
+
+grid.arrange(p1, p2, p3, p4, p5, p6, p7, ncol=4)
+```
+
+1. **Internet service:** Customers with Fiber optic service are more prone to churning than DSL service. It may be because DSL service may not be fast enough and customers use telco's internet and therefore, are less likely to churn.
+
+2. **Online security & Online backup:** Customers who do not have Online security or backup service are more likely to churn.
+
+3. **Device Protection and Tech Support:** Similarly customers who do not opt for device protection and tech support are more likely to churn.
+
+4. **Streaming services:** Streaming services do not significantly make a difference in customer churn behaviour.
+
+Additionally, we also see that popularity of services with customers is in the order StreamingMovies (49.5%) > StreamingTV (49.0%) > OnlineBackup (44.0%) > Device Protection (43.9%) > Tech support (37.0%) > Online security (36.6%).
+
+## Monthly charges paid by customers
+
+Let us look at how much on average monthly charges are paid by customers who churn. My guess is customers who churn are paying higher monthly charges than customers who do not churn. 
+
+```{r monthly_charges_avg, fig.width=10, fig.height=12}
+df <- churn %>% group_by(gender, tenure_group, Churn) %>% 
+   summarise(mean = median(MonthlyCharges)) %>% arrange(tenure_group)
+# Define the x positions for plotting text
+df$x <- rep(c(0.8,1.2,1.8,2.2),5)
+
+churn %>% ggplot(aes(y = MonthlyCharges,  x= gender, fill = Churn)) + 
+    geom_boxplot() + facet_wrap(~tenure_group) + 
+  geom_text(data = df, aes(label = round(mean, 1), y = mean + 3.0, x = x), size = 4) + 
+  theme_minimal() + scale_fill_brewer(palette="Dark2")
+```
+
+1. **Customers who churn pay much higher monthly bills on average** which makes sense since higher monthly bills would be hard on their pocket. It also seems to be a very distinguishing feature of people who churn.
+
+2. Another interesting pattern which we can see from the plot above is that **as months pass by customers who do not churn are happy to pay more**. For example the median monthly bills rise in the order 45.5,55.5,61.5,75.8,84.6 for female customers for tenures 0-12M, 12-24M, 24-48M, 48-60M and >60M, respectively.
+
+```{r pay_pref_overall, fig.width=9, fig.height=11, message=FALSE}
+churn$Internet <- ifelse(churn$InternetService %in% c("No"), "No", "Yes")
+
+churn %>% ggplot(aes(x = MonthlyCharges, fill = Internet)) + 
+    facet_wrap(~PaymentMethod) + theme_minimal() + 
+    scale_fill_brewer(palette="Dark2") + 
+    ggtitle(label = "Monthly Charges paid by customers through various payment methods with or without internet") +
+    ylab(label = "Count") + geom_histogram()
+
+```
+
+From the plot above we can see that **majority of customers who do not have internet service at home prefer to pay bills by Mailed check** (which is expected). Additionally, such customers usually have a small amount to be paid.
+
+Also, we can note that **most common payment method of customers who have internet service at home is Electronic check** although, *Bank transfer and Credit card* are also popular means of payment. 
+
+## Senior Citizen customers
+```{r pay_pref2, fig.width=8, fig.height=10, message=FALSE}
+
+  churn %>% ggplot(aes(x = MonthlyCharges, fill = Internet)) + 
+    geom_histogram() + facet_grid(SeniorCitizen~PaymentMethod) + theme_minimal() + 
+    scale_fill_brewer(palette="Dark2") + 
+    ggtitle(label = "Distribution of Monthly Charges paid by Senior Citizen Customers") +
+    ylab(label = "Count")
+```
+
+It looks like overall **Mailed checks again are the most common type of payment method for paying small monthly bills** by customers. It is interesting to note that Senior Citizens do not like to mail checks rather prefer to pay by electronic check which is quite interesting to know because one would think that senior citizens would be more old school.
+
+## Monthly charges by tenure group
+
+```{r tg, fig.width=8, fig.height=10, message=FALSE}
+churn %>% group_by(Churn) %>% ggplot(aes(x = MonthlyCharges, fill = Churn)) + geom_histogram() + facet_wrap(~tenure_group) + theme_minimal() + scale_fill_brewer(palette="Dark2") + ggtitle(label = "Monthly Charges paid by Customers over the tenure ") + ylab(label = "Count")
+```
+
+From the plot above it looks like **customers mostly churn when the tenure period is less than 12 months and Monthly charges are above 70 dollars**. 
+
+# Machine learning models
+
+Split the data into the train (80%) and test set (20%). Also, define the parameters necessary for model tuning and cross-validation. Before I jump to machine learning I would like to standardize the numerical variables and remove highly correlated variables. I will **remove redundant Internet** variables that I created during exploratory data analysis for better visualization and **log transform TotalCharges and normalize tenure variables**. 
+```{r prepare_data}
+# Create new variables
+churn <- churn %>% mutate(
+                          monthlyChargeOver69 = ifelse(MonthlyCharges > 69,"Yes","No") %>% as.factor(),
+                          tenureLessThan29 = ifelse(tenure < 29, "Yes","No") %>% as.factor(),
+                          TotalCharges = log(TotalCharges))
+
+
+# Remove redundant variables
+churn <- churn %>% select(-one_of(c("Internet")))
+
+# Normalize the data 
+pre_process <- churn %>% select_if(is.double) %>% preProcess(., method = c("center", "scale"))
+churn <- predict(pre_process, newdata = churn)
+
+# split the data
+set.seed(3000)
+inTrain <- createDataPartition(churn$Churn, p = 0.8, list = FALSE)
+
+training<- churn[inTrain,]
+testing<- churn[-inTrain,]
+
+# Print the dimensions of train and test set
+dimensions <- data.frame(matrix(c(dim(training), dim(testing)), ncol = 2, byrow = TRUE))
+colnames(dimensions) <- c("Rows", "Columns")
+rownames(dimensions) <- c("Train", "Test")
+
+dimensions %>% kable() %>% 
+  kable_styling(bootstrap_options = c("condensed","responsive"), full_width = F, position = "left", font_size = 10)
+
+train_y <- training %>% pull("Churn")
+train_x <- training %>% select(-c("Churn"))
+
+test_y <- testing %>% pull("Churn")
+test_x <- testing %>% select(-c("Churn"))
+
+# the logistic regression model parameters
+
+metric <- "logLoss"
+
+ctrl <- trainControl(
+  method = "cv", 
+  number = 5, 
+  savePredictions = "all", 
+  classProbs = TRUE, 
+  summaryFunction = multiClassSummary, 
+  verboseIter = FALSE)
+```
+
+## Logistic Regression
+
+```{r the logisticRegression, message=FALSE, warning=FALSE}
+set.seed(3000)
+
+weights <- c(0.681,1.881)
+
+model_weights <- ifelse(train_y == "No", weights[1], weights[2])
+
+model_glm <- train(x = train_x, y = train_y, method = "glm", trControl = ctrl, metric = metric, weights = model_weights)
+
+# Evaluate the model on the test data
+cm_glm <- cm(model = model_glm, data = test_x, target = test_y)
+
+print(cm_glm)
+```
+
+The overall accuracy of the model is **~75.1%** with the F1 score close to **~81.2%**. Balanced Accuracy is **76.7%**. Let us see if we can tweak the probability cutoff to achieve better accuracy.
+
+```{r tweek_lr}
+# Get the probabilitis of prediction
+p1 <- predict(model_glm, test_x, type = "prob")
+
+cutoff <- roc_cutoff(model_glm, data = test_x, test_y)
+
+opt_pred_glm <- ifelse(p1[,2] >= cutoff, "Yes","No")
+
+# Optimized predictions
+confusionMatrix(factor(opt_pred_glm), test_y, mode = "prec_recall")
+```
+
+By tweaking the cutoff we increased the F1 score of our model from **~81.2%** to **~82.3%** . Overall balanced accuracy metric also improved from **~76.7%** to **~77.4%** . 
+
+### Feature analysis
+
+```{r feature_analysis_lr}
+# Feature analysis
+print(summary(model_glm))
+```
+
+The most important features according to glm model are are *SeniorCitizen*, *MultipleLines*,*InternetService*, *Streaming services*,*Contract*, *PaperlessBilling*, *PaymentMethod* and *TotalCharges*. 
+
+### Let us remove less important variables
+
+```{r the logisticRegession2, message=FALSE, warning=FALSE}
+# Copy churn dataframe to churn2
+churn2 <- churn
+
+# Create a new column for add on services combined into one
+adds_on_columns <- churn2 %>% select(c(adds_on[3:6])) %>% mutate_at(.vars = vars(OnlineSecurity:TechSupport), .funs = funs(ifelse(. == "No", 0, 1)))
+
+churn2$adds_on <- rowSums(adds_on_columns) 
+
+# Remove redundant variables and less important variables
+churn2 <- churn2 %>% select(-one_of(c("gender", "Partner", "Dependents",
+                                     "tenure","PhoneService" ,"OnlineSecurity",
+                                     "OnlineBackup", "DeviceProtection","TechSupport", "MonthlyCharges",
+                                     "changeInBillSign", "changeInBill","tenureLessThan29")))
+
+# Normalize the data 
+pre_process <- churn2 %>% select(adds_on) %>% preProcess(., method = c("center", "scale"))
+churn2 <- predict(pre_process, newdata = churn2)
+
+# rebuild the train and test set with the same split as before
+
+training2<- churn2[inTrain,]
+testing2<- churn2[-inTrain,]
+
+# Print the dimensions of train and test set
+dimensions <- data.frame(matrix(c(dim(training2), dim(testing2)), ncol = 2, byrow = TRUE))
+colnames(dimensions) <- c("Rows", "Columns")
+rownames(dimensions) <- c("Train", "Test")
+
+dimensions %>% kable() %>% 
+  kable_styling(bootstrap_options = c("condensed","responsive"), full_width = F, position = "left", font_size = 10)
+
+train_y2 <- training2 %>% pull("Churn")
+train_x2 <- training2 %>% select(-c("Churn"))
+
+test_y2 <- testing2 %>% pull("Churn")
+test_x2 <- testing2 %>% select(-c("Churn"))
+
+# train the new model
+set.seed(3000)
+
+weights <- c(0.681,1.881)
+
+model_weights <- ifelse(train_y2 == "No", weights[1], weights[2])
+
+model_glm <- train(x = train_x2, y = train_y2, method = "glm", trControl = ctrl, metric = metric, weights = model_weights)
+
+# Evaluate the model on the test data
+cm_glm <- cm(model = model_glm, data = test_x2, target = test_y2)
+
+print(cm_glm)
+```
+
+By removing the variables we slightly decreased the predictive ability of our logistic regression model. Balanced Accuracy decreased from **~76.7%** to **76.3%**. However, it is a much simpler model and thus would be less prone to overfitting.
+Let us see if we can improve the model by tweaking the cutoff.
+
+```{r tweak_lr2}
+# Get the probabilitis of prediction
+p1 <- predict(model_glm, test_x2, type = "prob")
+
+cutoff <- roc_cutoff(model_glm, data = test_x2, test_y2)
+
+opt_pred_glm <- ifelse(p1[,2] >= cutoff, "Yes","No")
+
+# Optimized predictions
+confusionMatrix(factor(opt_pred_glm), test_y2, mode = "prec_recall")
+```
+
+Again by tweaking the cutoff we were able to increase the Balanced Accuracy of our model from **~76.3%** to **~77.0%** . However, it is slightly less than the previous more complex logistic regression model where the Balanced Accuracy was **~77.4%** . Nevertheless, this is a better model because we used fewer variables and the model accuracy did not decrease significantly. 
+
+## Decision trees 
+
+```{r dt, message=FALSE, warning=FALSE}
+# Let us build decision tree model 
+set.seed(3000)
+
+model_cart <- train(x = train_x2, y = train_y2, method = "rpart", trControl = ctrl, metric = metric, tuneLength = 15, weights = model_weights)
+
+cm_cart <- cm(model_cart,test_x2, test_y2)
+
+print(cm_cart)
+```
+
+The **Balanced Accuracy of the decision tree model is ~75.5%** less than the logistic regression. Let us optimize it.
+
+```{r tweak_dt}
+# Get the probabilitis of prediction
+p2 <- predict(model_cart, test_x2, type = "prob")
+
+cutoff <- roc_cutoff(model_cart, data = test_x2, test_y2)
+
+opt_pred_cart <- ifelse(p1[,2] >= cutoff, "Yes","No")
+
+# Optimized predictions
+confusionMatrix(factor(opt_pred_cart), test_y2, mode = "prec_recall")
+```
+Unlike the logistic regression, we were not able to improve the Balanced Accuracy of the DT model by optimizing it however, Recall and the F1 score improved dramatically.   
+
+## Random forest
+
+```{r rf}
+set.seed(3000)
+model_rf <- train(x = train_x2, y = train_y2, method = "ranger", trControl = ctrl, metric = metric, tuneLength = 11, weights = model_weights)
+
+cm_rf <- cm(model_rf,test_x2, test_y2)
+
+print(cm_rf)
+```
+
+
+The **balanced accuracy of the random forest tree model is ~74.4** less than the logistic regression and decision tree model. Let us optimize it.
+
+
+```{r tweak_rf}
+# Get the probabilitis of prediction
+p3 <- predict(model_rf, test_x2, type = "prob")
+
+cutoff <- roc_cutoff(model_rf, data = test_x2, test_y2)
+
+opt_pred_rf <- ifelse(p1[,2] >= cutoff, "Yes","No")
+
+# Optimized predictions
+confusionMatrix(factor(opt_pred_rf), test_y2, mode = "prec_recall")
+```
+
+Like LR and DT models the **balanced accuracy** of the RF model was improved from **~74.4%** to **~75.9%** however, Recall and F1 score decreased significantly. The **Specificity** of the model is very high **~84.5%**, in fact, the highest we have got till now. This means that the RF model is doing well in predicting customers who will churn however, there are many False Negatives as well.
+
+## Multilayer perceptron model
+
+```{r mlp_data_prep}
+# Create one hot encoded variables
+dmy <- dummyVars("~SeniorCitizen + MultipleLines + InternetService + StreamingTV + StreamingMovies + Contract + PaperlessBilling + PaymentMethod + tenure_group + monthlyChargeOver69", data = churn2)
+
+ohe_churn <- predict(dmy, newdata = churn2) %>% as.data.frame()
+num_churn <- churn2 %>% select_if(is.numeric)
+
+preProcessObject <- preProcess(ohe_churn, method = c("center","scale"))
+ohe_churn <- predict(preProcessObject, ohe_churn)
+
+churn_data <- cbind(ohe_churn, num_churn) %>% as.matrix()
+
+churn_data2 <- churn_data[,c("SeniorCitizen.Yes", "MultipleLines.Yes", "InternetService.DSL","InternetService.Fiber optic", "InternetService.No", "StreamingTV.Yes", "StreamingMovies.Yes","Contract.Month-to-month","Contract.One year","Contract.Two year", "PaperlessBilling.Yes", "PaymentMethod.Bank transfer", "PaymentMethod.Credit card", "PaymentMethod.Electronic check", "PaymentMethod.Mailed check", "tenure_group.>60M", "tenure_group.0-12M","tenure_group.12-24M","tenure_group.24-48M","tenure_group.48-60M", "monthlyChargeOver69.Yes", "TotalCharges", "adds_on")]
+
+train_data <- churn_data2[inTrain,]
+test_data <- churn_data2[-inTrain,]
+
+train_labels <- to_categorical(as.integer(train_y2)-1, num_classes = 2)
+test_labels <- to_categorical(as.integer(test_y2)-1, num_classes = 2)
+```
+
+Let us do the grid search with differnet optimizers, activators and number of hidden layers and choose the best one to build our final model.
+
+Best model uses *rmsprop* optimizer with *relu* activator and *hidden layer structure (8,4,2)*. 
+
+```{r mlp_model, warning=FALSE, message=FALSE}
+set.seed(3000)
+class_weights = list('0' = weights[1], '1' = weights[2])
+
+# Create a function to train the network
+train_network <- function(structure, activation,optimizer, epochs){
+  suppressMessages(use_session_with_seed(3000))
+  model <- keras_model_sequential()
+  
+  model %>%
+    layer_dense(units = structure[2], activation = activation, input_shape = structure[1]) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = structure[3], activation = activation) %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(units = structure[4], activation = activation) %>%
+    layer_dropout(rate = 0.1) %>%
+    layer_dense(units = 2, activation = "softmax")
+  
+  model %>% 
+    compile(loss = "binary_crossentropy", optimizer = optimizer, metric = c("accuracy"))
+
+  history <- model %>%
+    fit(x = train_data, y = train_labels, shuffle = T, epochs = epochs, batch_size = 600, 
+        validation_split = 0.3, class_weight = class_weights, verbose = 0)
+
+  history_df <- as.data.frame(history)
+  acc <<- history_df[nrow(history_df),2]
+
+  pref <- model %>% evaluate(test_data, test_labels, verbose = 0)
+
+  testacc <<- pref$acc
+  
+  return(model)
+}
+
+sample_epochs <- 100
+
+# Initialise empty lists to store results
+train_acc <- c()
+test_acc <- c()
+combination_vector <- c()
+
+
+# Create a vector listing all the activation functions we wish to test
+activation_functions <- c("elu", "hard_sigmoid", "linear", "relu", "selu", "sigmoid",
+                         "softplus", "softsign", "tanh")
+
+
+# Create a vector listing all the optimization functions we wish to test
+optimizer_functions <- c("adadelta", "adagrad", "adam", "adamax",
+                        "nadam", "rmsprop", "sgd")
+
+# Tune the network with different parameters
+
+for(i in 1:length(optimizer_functions)){
+    for(j in 1:length(activation_functions)){
+      # Optimize hidden layers
+      for(k in 2:16)
+      {
+        NN_structure <- c(ncol(train_data),k,as.integer(k/2),as.integer(k/4))
+        combination <- paste("Optimizer:",optimizer_functions[i], "Activator:",
+                             activation_functions[j], "Layers:",k, sep = " ")
+        combination_vector <- append(combination_vector, combination)
+        #print(combination)
+
+        # Call the function
+          model <- train_network(NN_structure, activation_functions[j], optimizer_functions[i], sample_epochs)
+          train_acc <- append(train_acc, acc)
+          test_acc <- append(test_acc, testacc)
+      }
+    }
+  }
+
+
+# Collect the results
+combination_matrix <- str_split(combination_vector, pattern = " ", simplify = TRUE)
+
+train_acc <- train_acc[!is.na(train_acc)]
+test_acc <- test_acc[!is.na(test_acc)]
+
+results <- data.frame(acc_train = train_acc, acc_test = test_acc, optimizer = combination_matrix[,2], activator = combination_matrix[,4], nLayers = combination_matrix[,6] ,stringsAsFactors = FALSE)
+
+results %>% group_by(optimizer, activator) %>% top_n(., 1, acc_train) %>% ggplot(aes(x = acc_train, y = acc_train, color = optimizer)) + geom_point(size = 3.5) + facet_wrap(~activator)
+
+
+# Final train using the best parameters
+bst_para <- combination_vector[which.max(results$acc_test)]
+
+bst_para <- str_split(bst_para, pattern = " ") %>% unlist()
+
+bst_optimizer <- bst_para[2]
+bst_activator <- bst_para[4]
+bst_layer <- as.integer(bst_para[6])
+
+bst_structure <- c(ncol(train_data),bst_layer,as.integer(bst_layer/2),as.integer(bst_layer/4))
+
+model <- train_network(bst_structure, bst_activator, bst_optimizer, sample_epochs)
+
+# get the summary of the model
+summary(model) %>% kable() 
+
+# Evaluate the model on test set
+model %>% evaluate(test_data, test_labels)
+
+# Predict the classes and make a confusion matrix
+
+ pred_nn <- model %>% predict_classes(test_data)
+ pred_nn <- pred_nn %>% recode('0' = "No", '1' = "Yes") %>% as.factor()
+
+ pred_nn_prob <- model %>% predict_proba(test_data) %>% as.data.frame() %>% pull(2)
+
+ confusionMatrix(pred_nn, test_y2, mode = "prec_recall")
+```
+
+
+
+The **Balanced Accuracy** of the Multilayer Perceptron model is **75.2%** which is less than the logistic regression model however it has a much better the F1 score **~85.0%**and Recall score **~82.6%**. This is the highest F1 score we have got till now.  
+
+## Gradient Boosting Machine (GBM)
+
+```{r gbm, message=FALSE, warning=FALSE}
+set.seed(3000)
+cl <- makeCluster(6)
+registerDoParallel(cl)
+
+gbmGrid <- expand.grid(interaction.depth = seq(5,10,2), n.trees = c(5:10) * 50, shrinkage = seq(0.01, 0.05, 0.01), n.minobsinnode = seq(10,40,10))
+
+model_gbm <- train(x = train_data, y = train_y2, method = "gbm", trControl = ctrl, metric = metric, tuneGrid = gbmGrid, weights = model_weights)
+
+
+cm_gbm <- cm(model_gbm,test_data, test_y2)
+
+print(cm_gbm)
+
+stopCluster(cl)
+#print("Cluster stopped")
+
+# insert serial backend, otherwise error in summary.connection(connection) : invalid connection
+registerDoSEQ()
+
+```
+
+The **Balanced Accuracy** of the GBM model is **~76.3%** less than the best we have in the logistic regression model **~77.4%**.
+
+```{r tweak_gbm}
+# Get the probabilitis of prediction
+p4 <- predict(model_gbm, test_data, type = "prob")
+
+cutoff <- roc_cutoff(model_gbm, data = test_data, test_y2)
+
+opt_pred_gbm <- ifelse(p4[,2] >= cutoff, "Yes","No")
+
+# Optimized predictions
+confusionMatrix(factor(opt_pred_gbm), test_y2, mode = "prec_recall")
+```
+
+By tweaking cutoff value we were able to slightly improve the **Balanced Accuracy** of the GBM model from **~76.3%** to   **~76.6%** which is still less than best we have so far.
+
+## Model Averaged Neural Network (AvNNET) 
+
+```{r avNNet}
+set.seed(3000)
+cl <- makeCluster(6)
+registerDoParallel(cl)
+
+nnGrid <- expand.grid(size = seq(1,3,1), decay = seq(0.0001, 0.001, 0.0001), bag = c(TRUE, FALSE))
+
+model_avNNet <- train(x = train_x2, y = train_y2, method = "avNNet", trControl = ctrl, metric = metric, tuneGrid = nnGrid, weights = model_weights, repeats = 10)
+
+
+cm_avNNet <- cm(model_avNNet,test_x2, test_y2)
+
+print(cm_avNNet)
+
+stopCluster(cl)
+#print("Cluster stopped")
+
+# insert serial backend, otherwise error in summary.connection(connection) : invalid connection
+registerDoSEQ()
+```
+
+The *avNNet* is a model where the same neural network model is fit using different random number seeds. All the resulting models are used for prediction. The average Neural Network has the best F1 score till now **~87.0%** even better than the Keras model of **~85.0%** . However, the Balanced Accuracy has taken a beating **~69.7%** . Let us try to optimize it.
+
+```{r tweak_avNNet}
+# Get the probabilitis of prediction
+p5 <- predict(model_avNNet, test_x2, type = "prob")
+
+cutoff <- roc_cutoff(model_avNNet, data = test_x2, test_y2)
+
+opt_pred_avNNet <- ifelse(p5[,2] >= cutoff, "Yes","No")
+
+# Optimized predictions
+confusionMatrix(factor(opt_pred_avNNet), test_y2, mode = "prec_recall")
+```
+
+By tweaking the cutoff we were able to improve the Balanced Accuracy from **~69.7%** to **~77.3%** however it came at an expense of the F1 score. Another notable change was in the **Specificity** of the model which increased from **~48.0%** to **~81.5%**. 
+
+# Conclusion
+
+There are a wide variety of machine learning algorithms applicable to predicting customer churn. **Choosing one model over the other will depend on the questions we are trying to answer**. For example, businesses more interested in predicting customers who will churn will likely choose an optimized RF or avNNet model, on the other hand businesses who want to design their strategy to align for customers who are likely to stay may choose unoptimized avNNet model. Yet others may choose a Logistic Regression model to predict both types of customers equally well. To conclude, there is no best model it just depends on what you are trying to answer.
+
